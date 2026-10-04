@@ -1,0 +1,150 @@
+import ast, csv, sys
+from contextlib import asynccontextmanager
+from datetime import datetime
+
+from elasticsearch import AsyncElasticsearch, NotFoundError
+from fastapi import Depends, FastAPI, HTTPException, Query
+from pydantic import BaseModel, ConfigDict
+from sqlalchemy import ARRAY, DateTime, Integer, Text, delete, select
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+
+DB_URL = "postgresql+asyncpg://postgres:postgres@db:5432/search"
+ES_URL = "http://elastic:9200"
+INDEX = "documents"
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+class Document(Base):
+    __tablename__ = "documents"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    rubrics: Mapped[list[str]] = mapped_column(ARRAY(Text))
+    text: Mapped[str] = mapped_column(Text)
+    created_date: Mapped[datetime] = mapped_column(DateTime, index=True)
+
+
+engine = create_async_engine(DB_URL)
+Session = async_sessionmaker(engine, expire_on_commit=False)
+
+
+async def get_session():
+    async with Session() as s:
+        yield s
+
+
+es = AsyncElasticsearch(ES_URL)
+
+
+async def ensure_index():
+    if not await es.indices.exists(index=INDEX):
+        await es.indices.create(
+            index=INDEX,
+            mappings={"properties": {"id": {"type": "integer"}, "text": {"type": "text"}}},
+        )
+
+
+class DocOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    rubrics: list[str]
+    text: str
+    created_date: datetime
+
+
+@asynccontextmanager
+async def lifespan(_):
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    await ensure_index()
+    yield
+    await es.close()
+    await engine.dispose()
+
+
+app = FastAPI(title="Search Service", lifespan=lifespan)
+
+
+@app.get("/search", response_model=list[DocOut])
+async def search(q: str = Query(..., min_length=1), s: AsyncSession = Depends(get_session)):
+    resp = await es.search(index=INDEX, query={"match": {"text": q}}, size=200, _source=["id"])
+    ids = [h["_source"]["id"] for h in resp["hits"]["hits"]]
+    if not ids:
+        return []
+    stmt = (
+        select(Document)
+        .where(Document.id.in_(ids))
+        .order_by(Document.created_date.desc())
+        .limit(20)
+    )
+    return list((await s.execute(stmt)).scalars().all())
+
+
+@app.delete("/documents/{doc_id}", status_code=204)
+async def delete_doc(doc_id: int, s: AsyncSession = Depends(get_session)):
+    res = await s.execute(delete(Document).where(Document.id == doc_id))
+    await s.commit()
+    try:
+        await es.delete(index=INDEX, id=doc_id, refresh="wait_for")
+    except NotFoundError:
+        pass
+    if not res.rowcount:
+        raise HTTPException(404, "Not found")
+
+
+# ---------- загрузка CSV ----------
+def parse_rubrics(v: str) -> list[str]:
+    v = (v or "").strip()
+    if v.startswith("["):
+        try:
+            return [str(x) for x in ast.literal_eval(v)]
+        except Exception:
+            pass
+    return [p.strip() for p in v.split(",") if p.strip()]
+
+
+def parse_date(v: str) -> datetime:
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(v.strip(), fmt)
+        except ValueError:
+            continue
+    return datetime.fromisoformat(v)
+
+
+async def load(path: str):
+    async with engine.begin() as c:
+        await c.run_sync(Base.metadata.create_all)
+    await ensure_index()
+    n = 0
+    async with Session() as s:
+        with open(path, encoding="utf-8", newline="") as f:
+            for i, row in enumerate(csv.DictReader(f), start=1):
+                text = (row.get("text") or "").strip()
+                if not text:
+                    continue
+                s.add(
+                    Document(
+                        id=i,
+                        rubrics=parse_rubrics(row.get("rubrics", "")),
+                        text=text,
+                        created_date=parse_date(row["created_date"]),
+                    )
+                )
+                await es.index(
+                    index=INDEX, id=i, document={"id": i, "text": text}, refresh=False
+                )
+                n += 1
+                if n % 200 == 0:
+                    await s.commit()
+                    print(f"  {n}...")
+        await s.commit()
+        await es.indices.refresh(index=INDEX)
+    print(f"ГОТОВО. Загружено: {n}")
+
+
+if __name__ == "__main__" and len(sys.argv) > 2 and sys.argv[1] == "load":
+    import asyncio
+    asyncio.run(load(sys.argv[2]))

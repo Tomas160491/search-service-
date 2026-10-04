@@ -1,0 +1,7 @@
+search-service/
+├── main.py
+├── Dockerfile
+├── docker-compose.yml
+├── README.md
+├── .gitignore
+└── posts.csv
